@@ -1,0 +1,1247 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""Precomputed Kang-style NSDF -> shared initial/VCT -> OPS+GDPS and CAD-BPG.
+
+Use NSDF from STL_SDF_paper.py (grid_sign required).
+SDF interpolation uses trilinear grid samples; non-band nodes get signed
+saturation at +/-band_width, NOT exact geometric distances. This is a
+numerical approximation and NOT a direct STL geometric distance oracle.
+Method kernels are preserved from the two user-supplied Neuralangelo codes.
+No Neuralangelo checkpoint or GPU is required.
+"""
+import argparse
+import csv
+import json
+import time
+import shutil
+from pathlib import Path
+import numpy as np
+from scipy.ndimage import binary_dilation
+from scipy.spatial import cKDTree
+
+C_SHIFT = 0.1
+GDPS_C_VOL = 0.1
+PST_MONAGHAN_RP = 0.2
+PST_MONAGHAN_N = 4
+PST_HH_RATIO = 1.0
+PST_SHIFT_LIMIT_HH_RATIO = 0.01
+BPG_H_RATIO = 1.05
+BPG_PRESSURE = 1.0
+BPG_CFL = 0.25
+BPG_MAX_SHIFT_RATIO = 0.01
+SDF_NEGATIVE_IS_INSIDE = True
+MAT_BOUNDARY = 1
+MAT_INTERNAL = 2
+
+class GridNSDF:
+    def __init__(self, path):
+        with np.load(path, allow_pickle=False) as f:
+            for field in ('grid_sign','indices','sdf','origin','spacing','shape','band_width'):
+                if field not in f: raise ValueError(f'Missing NSDF field: {field}')
+            self.shape=tuple(map(int,f['shape']))
+            self.origin=np.asarray(f['origin'],float)
+            self.dx=float(f['spacing'])
+            self.band=float(f['band_width'])
+            self.sign=np.asarray(f['grid_sign'],np.int8)
+            ids=np.asarray(f['indices'],int)
+            phi=np.asarray(f['sdf'],float)
+        if self.sign.shape != self.shape:
+            raise ValueError('grid_sign absent or wrong shape. Regenerate STL_SDF_paper.py without --no-scan')
+        self.phi=np.where(self.sign<0,-self.band,self.band).astype(np.float32)
+        self.phi[ids[:,0],ids[:,1],ids[:,2]]=phi.astype(np.float32)
+        self.known=np.zeros(self.shape,bool)
+        self.known[ids[:,0],ids[:,1],ids[:,2]]=True
+        self.indices=ids
+        print(f'[NSDF] grid={self.shape}, narrowband={len(ids):,}, dx={self.dx}',flush=True)
+
+    def query(self,points,normals=False):
+        x=np.asarray(points,float).reshape(-1,3)
+        if len(x)==0:
+            return (np.empty(0),np.empty((0,3))) if normals else np.empty(0)
+        q=(x-self.origin)/self.dx
+        if np.any(q < -1e-9) or np.any(q > np.asarray(self.shape)-1+1e-9):
+            raise ValueError('SDF query outside grid. NSDF needs larger --padding for this motion.')
+        q=np.clip(q,0,np.asarray(self.shape)-1)
+        lo=np.minimum(np.floor(q).astype(int),np.asarray(self.shape)-2)
+        t=q-lo
+        vals=np.zeros(len(x))
+        gradient=np.zeros((len(x),3))
+        for a in (0,1):
+            for b in (0,1):
+                for c in (0,1):
+                    v=self.phi[lo[:,0]+a,lo[:,1]+b,lo[:,2]+c]
+                    wx=t[:,0] if a else 1-t[:,0]
+                    wy=t[:,1] if b else 1-t[:,1]
+                    wz=t[:,2] if c else 1-t[:,2]
+                    vals+=wx*wy*wz*v
+                    gradient[:,0]+=(1 if a else -1)*wy*wz*v/self.dx
+                    gradient[:,1]+=wx*(1 if b else -1)*wz*v/self.dx
+                    gradient[:,2]+=wx*wy*(1 if c else -1)*v/self.dx
+        if not normals:return vals
+        nm=np.linalg.norm(gradient,axis=1)
+        gradient[nm>1e-12]/=nm[nm>1e-12,None]
+        gradient[nm<=1e-12]=0.0
+        return vals,gradient
+
+def export_nsdf_stage(grid, source, out):
+    """Save the original NSDF stage separately, before any particle operations.
+
+    The NPZ is copied byte-for-byte, preserving grid_sign and normalization
+    metadata. The VTK contains *narrowband grid sites*, not SPH particles.
+    """
+    out = Path(out)
+    out.mkdir(parents=True, exist_ok=True)
+    src = Path(source)
+    dst = out / 'nsdf.npz'
+    if src.resolve() != dst.resolve():
+        shutil.copy2(src, dst)
+    with np.load(src, allow_pickle=False) as z:
+        idx = np.asarray(z['indices'], dtype=np.int32)
+        sdf = np.asarray(z['sdf'], dtype=np.float32)
+        points = (np.asarray(z['points'], dtype=np.float32)
+                  if 'points' in z else grid.origin + idx * grid.dx)
+        normals = (np.asarray(z['normals'], dtype=np.float32)
+                   if 'normals' in z else None)
+    # Compact VTK legacy POLYDATA, binary, one vertex per narrowband grid site
+    path = out / 'nsdf.vtk'
+    n = len(points)
+    with path.open('wb') as f:
+        def line(msg): f.write((msg + '\n').encode('ascii'))
+        line('# vtk DataFile Version 3.0')
+        line('NSDF grid samples - NOT particle model')
+        line('BINARY')
+        line('DATASET POLYDATA')
+        line(f'POINTS {n} float')
+        f.write(np.asarray(points, dtype='>f4').tobytes() + b'\n')
+        line(f'VERTICES {n} {2*n}')
+        vertices = np.column_stack((np.ones(n, dtype=np.int32),
+                                    np.arange(n, dtype=np.int32)))
+        f.write(vertices.astype('>i4').tobytes() + b'\n')
+        line(f'POINT_DATA {n}')
+        line('SCALARS sdf float 1')
+        line('LOOKUP_TABLE default')
+        f.write(sdf.astype('>f4').tobytes() + b'\n')
+        if normals is not None:
+            line('VECTORS normal float')
+            f.write(normals.astype('>f4').tobytes() + b'\n')
+    print(f'[OUTPUT NSDF] {dst} and {path} ({n:,} narrowband grid sites)', flush=True)
+
+
+def write_before_vct(grid, out):
+    """Output shared Cartesian interior particles BEFORE VCT, once."""
+    inside = (grid.sign < 0) & (grid.phi < -0.5 * grid.dx)
+    ids = np.column_stack(np.nonzero(inside))
+    points = grid.origin + ids * grid.dx
+    data = pack(points, grid.dx, grid.phi[inside])
+    data['mat_id'][:] = MAT_INTERNAL
+    write_dat(Path(out) / 'initial_before_vct.dat', data)
+    write_vtk(Path(out) / 'initial_before_vct.vtk', data)
+    print(f'[OUTPUT BEFORE VCT] {len(points):,} Cartesian particles', flush=True)
+
+
+def pack(points,dx,sdf=None):
+    p=np.asarray(points,float).reshape(-1,3)
+    n=len(p)
+    return dict(pid=np.arange(1,n+1),mat_id=np.full(n,2),x=p[:,0].copy(),y=p[:,1].copy(),z=p[:,2].copy(),
+      vx=np.zeros(n),vy=np.zeros(n),vz=np.zeros(n),vm_dist=np.full(n,dx),nx=np.zeros(n),ny=np.zeros(n),nz=np.zeros(n),
+      sdf=np.zeros(n) if sdf is None else np.asarray(sdf,float).copy(),zone_id=np.zeros(n,dtype=int),fixed_particle=np.zeros(n,dtype=int))
+
+def get_points(data):return np.column_stack((data['x'],data['y'],data['z']))
+def set_points(data,p):data['x'][:]=p[:,0];data['y'][:]=p[:,1];data['z'][:]=p[:,2]
+def cp(data):return {k:v.copy() for k,v in data.items()}
+
+def write_dat(path,data):
+    p=Path(path);p.parent.mkdir(parents=True,exist_ok=True)
+    with p.open('w') as f:
+        f.write(f'{len(data["pid"]):12d}\n')
+        for i in range(len(data['pid'])):
+            f.write(f'{int(data["pid"][i]):10d}{int(data["mat_id"][i]):10d}'+''.join(f'{float(data[k][i]):20.12f}' for k in ('x','y','z','vx','vy','vz','vm_dist','nx','ny','nz','sdf'))+'\n')
+
+def write_vtk(path, data, rho=None, grad=None, shift=None,
+              metrics=None, display_diameter_ratio=1.4):
+    """Binary VTK: all point metrics are ParaView Color By arrays."""
+    p = Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    xyz = get_points(data).astype('>f4')
+    n = len(xyz)
+    scalar_arrays = {k: np.asarray(data[k]) for k in
+                     ('mat_id', 'zone_id', 'fixed_particle', 'sdf')}
+    scalar_arrays['render_radius'] = np.full(
+        n, float(data['vm_dist'][0]) * display_diameter_ratio / 2.0)
+    if rho is not None:
+        scalar_arrays['number_density'] = np.asarray(rho)
+    if grad is not None:
+        scalar_arrays['density_gradient_magnitude'] = np.linalg.norm(grad, axis=1)
+    if shift is not None:
+        scalar_arrays['shift_magnitude'] = np.linalg.norm(shift, axis=1)
+    if metrics:
+        scalar_arrays.update(metrics)
+    vector_arrays = {}
+    if grad is not None:
+        vector_arrays['density_gradient'] = grad
+    if shift is not None:
+        vector_arrays['shift_vector'] = shift
+    with p.open('wb') as f:
+        def line(s): f.write((s + '\n').encode('ascii'))
+        line('# vtk DataFile Version 3.0')
+        line('STL NSDF particle model with convergence and quality metrics')
+        line('BINARY')
+        line('DATASET POLYDATA')
+        line(f'POINTS {n} float')
+        f.write(xyz.tobytes() + b'\n')
+        line(f'VERTICES {n} {2*n}')
+        verts = np.column_stack((np.ones(n, np.int32), np.arange(n, dtype=np.int32)))
+        f.write(verts.astype('>i4').tobytes() + b'\n')
+        line(f'POINT_DATA {n}')
+        for name, value in scalar_arrays.items():
+            value = np.asarray(value)
+            if value.shape != (n,):
+                raise ValueError(f'{name}: expected {n} point values, got {value.shape}')
+            if np.issubdtype(value.dtype, np.integer):
+                line(f'SCALARS {name} int 1')
+                value = value.astype('>i4')
+            else:
+                line(f'SCALARS {name} float 1')
+                value = value.astype('>f4')
+            line('LOOKUP_TABLE default')
+            f.write(value.tobytes() + b'\n')
+        for name, value in vector_arrays.items():
+            value = np.asarray(value)
+            if value.shape != (n, 3):
+                raise ValueError(f'{name}: expected ({n},3)')
+            line(f'VECTORS {name} float')
+            f.write(value.astype('>f4').tobytes() + b'\n')
+
+
+def prepare(grid,subdiv=6):
+    dx=grid.dx
+    # Exact at grid nodes; deep interior uses scanned signs and saturated SDF.
+    inside=(grid.sign<0)&(grid.phi < -0.5*dx)
+    idx=np.column_stack(np.nonzero(inside))
+    pts=grid.origin+idx*dx
+    base=pack(pts,dx,grid.phi[inside])
+    print(f'[INITIAL] {len(pts):,} interior particle centers',flush=True)
+    # Centers of crossed cells: corners classified via SDF interpolation.
+    # Includes a one-cell halo around signed narrowband nodes.
+    shape=grid.shape
+    near=binary_dilation(grid.known,iterations=1)
+    candidates=np.column_stack(np.nonzero(near))
+    inside_volume=[]; compensation=[]
+    ss=((np.arange(subdiv)+0.5)/subdiv-0.5)*dx
+    offsets=np.stack(np.meshgrid(ss,ss,ss,indexing='ij'),-1).reshape(-1,3)
+    sigma=0.0; count=0
+    for ii in range(0,len(candidates),32):
+        chunk=candidates[ii:ii+32]
+        centers=grid.origin+chunk*dx
+        corner=centers[:,None,:]+np.array(np.meshgrid([-0.5,0.5],[-0.5,0.5],[-0.5,0.5],indexing='ij')).reshape(3,-1).T[None,:,:]*dx
+        # Ignore boundary cells whose subcell samples leave the background grid.
+        valid=np.all((corner>=grid.origin-1e-10)&(corner<=grid.origin+dx*(np.asarray(grid.shape)-1)+1e-10),axis=(1,2))
+        if not np.any(valid):continue
+        valid_centers=centers[valid]
+        sdfc=grid.query(corner[valid].reshape(-1,3)).reshape(len(valid_centers),8)
+        crossed=(sdfc.min(axis=1)<=0)&(sdfc.max(axis=1)>=0)
+        for cc in valid_centers[crossed]:
+            samples=cc+offsets
+            frac=np.mean(grid.query(samples)<0)
+            sigma+=frac
+            count+=1
+            if sigma>=1.0:
+                compensation.append(cc.copy());sigma-=1.0
+    if compensation:
+        bc=np.asarray(compensation)
+        merged=pack(np.vstack((pts,bc)),dx)
+        merged['mat_id'][len(pts):]=1
+        merged['sdf']=grid.query(get_points(merged))
+    else:merged=base
+    print(f'[VCT] crossing cells={count:,} added={len(compensation):,} residual_volume={sigma*dx**3:.4e}',flush=True)
+    return merged
+
+def project(points,grid,dx,fixed=None):
+    p=points.copy();phi,n=grid.query(p,True)
+    bad=phi > -0.5*dx
+    if fixed is not None:bad &= ~fixed
+    p[bad]-=(phi[bad]+0.5*dx)[:,None]*n[bad]
+    return p
+
+def final_metadata(data,grid,dx):
+    pts=get_points(data)
+    phi,n=grid.query(pts,True)
+    data['sdf']=phi
+    boundary=phi >= -dx
+    data['mat_id']=np.where(boundary,1,2)
+    data['nx']=np.where(boundary,n[:,0],0)
+    data['ny']=np.where(boundary,n[:,1],0)
+    data['nz']=np.where(boundary,n[:,2],0)
+
+def fixed_layers(points,n=2):
+    if n<=0:return np.zeros(len(points),bool)
+    levels=np.unique(np.round(points[:,1],8))
+    return np.isin(np.round(points[:,1],8),levels[:n])
+
+
+def cubic_spline_weight_and_grad_batch(points, i, ids, hh):
+
+
+
+    """
+
+
+
+    3-D cubic-spline kernel and grad_i W_ij copied from the uploaded
+
+
+
+    Fortran subroutine `weight`.
+
+
+
+    For q = r/hh:
+
+
+
+        W = 1/(pi*hh^3) * f(q)
+
+
+
+    with support q <= 2.  The returned gradient is with respect to
+
+
+
+    particle i, matching the Fortran use of (x_i - x_j)/r/hh.
+
+
+
+    """
+
+
+
+    ids = np.asarray(ids, dtype=np.int64)
+
+
+
+    if len(ids) == 0:
+
+
+
+        return (
+
+
+
+            np.zeros(0, dtype=np.float64),
+
+
+
+            np.zeros((0, 3), dtype=np.float64),
+
+
+
+            np.zeros(0, dtype=np.float64),
+
+
+
+        )
+
+
+
+    rij = points[i][None, :] - points[ids]
+
+
+
+    r = np.linalg.norm(rij, axis=1)
+
+
+
+    q = r / hh
+
+
+
+    W = np.zeros(len(ids), dtype=np.float64)
+
+
+
+    dshape_dq = np.zeros(len(ids), dtype=np.float64)
+
+
+
+    c1 = 1.0 / (np.pi * hh**3)
+
+
+
+    m1 = (q >= 0.0) & (q <= 1.0) & (r > 1.0e-12)
+
+
+
+    if np.any(m1):
+
+
+
+        qm = q[m1]
+
+
+
+        W[m1] = c1 * (
+
+
+
+            1.0 - 1.5 * qm**2 + 0.75 * qm**3
+
+
+
+        )
+
+
+
+        dshape_dq[m1] = c1 * (
+
+
+
+            -3.0 * qm + 2.25 * qm**2
+
+
+
+        )
+
+
+
+    m2 = (q > 1.0) & (q <= 2.0) & (r > 1.0e-12)
+
+
+
+    if np.any(m2):
+
+
+
+        qm = q[m2]
+
+
+
+        W[m2] = c1 * (
+
+
+
+            0.25 * (2.0 - qm)**3
+
+
+
+        )
+
+
+
+        dshape_dq[m2] = c1 * (
+
+
+
+            -0.75 * (2.0 - qm)**2
+
+
+
+        )
+
+
+
+    gradW = np.zeros((len(ids), 3), dtype=np.float64)
+
+
+
+    valid = (r > 1.0e-12) & (q <= 2.0)
+
+
+
+    if np.any(valid):
+
+
+
+        gradW[valid] = (
+
+
+
+            dshape_dq[valid, None]
+
+
+
+            * rij[valid]
+
+
+
+            / r[valid, None]
+
+
+
+            / hh
+
+
+
+        )
+
+
+
+    return W, gradW, r
+
+
+def cubic_spline_weight_at_dx(dx, hh):
+
+
+
+    """Fortran `ww = W(r=dx)` used by Monaghan control."""
+
+
+
+    q = dx / hh
+
+
+
+    c1 = 1.0 / (np.pi * hh**3)
+
+
+
+    if 0.0 <= q <= 1.0:
+
+
+
+        return c1 * (
+
+
+
+            1.0 - 1.5 * q**2 + 0.75 * q**3
+
+
+
+        )
+
+
+
+    if 1.0 < q <= 2.0:
+
+
+
+        return c1 * (
+
+
+
+            0.25 * (2.0 - q)**3
+
+
+
+        )
+
+
+
+    raise ValueError(
+
+
+
+        f"Invalid PST_HH_RATIO: dx/hh={q:.6g} gives W(dx)=0. "
+
+
+
+        "The Fortran Monaghan factor requires dx/hh <= 2."
+
+
+
+    )
+
+
+def concentration_gradient_for_pst(
+
+
+
+    points,
+
+
+
+    dx,
+
+
+
+    hh,
+
+
+
+    rp=PST_MONAGHAN_RP,
+
+
+
+    nn=PST_MONAGHAN_N,
+
+
+
+):
+
+
+
+    """
+
+
+
+    Python port of the concentration-gradient part of
+
+
+
+    `renorm_mat_for_PS_Wall`:
+
+
+
+        gradC_i = sum_j V_j
+
+
+
+                  * [1 + rp*(W_ij/W(dx))^nn]
+
+
+
+                  * grad_i W_ij
+
+
+
+    For the generated solid particles m_j/rho_j is represented by the
+
+
+
+    uniform particle volume V_j = dx^3.
+
+
+
+    """
+
+
+
+    points = np.asarray(points, dtype=np.float64)
+
+
+
+    n = len(points)
+
+
+
+    gradC = np.zeros((n, 3), dtype=np.float64)
+
+
+
+    if n == 0:
+
+
+
+        return gradC
+
+
+
+    ww = cubic_spline_weight_at_dx(dx, hh)
+
+
+
+    if abs(ww) <= 1.0e-30:
+
+
+
+        raise ValueError("W(dx) is zero in PST concentration gradient")
+
+
+
+    particle_volume = dx**3
+
+
+
+    support = 2.0 * hh
+
+
+
+    tree = cKDTree(points)
+
+
+
+    neighbors = tree.query_ball_point(points, support)
+
+
+
+    for i, ids in enumerate(neighbors):
+
+
+
+        ids = np.asarray(ids, dtype=np.int64)
+
+
+
+        ids = ids[ids != i]
+
+
+
+        if len(ids) == 0:
+
+
+
+            continue
+
+
+
+        W, gradW, r = cubic_spline_weight_and_grad_batch(
+
+
+
+            points=points,
+
+
+
+            i=i,
+
+
+
+            ids=ids,
+
+
+
+            hh=hh,
+
+
+
+        )
+
+
+
+        valid = (r > 1.0e-12) & (r <= support) & (W > 0.0)
+
+
+
+        if not np.any(valid):
+
+
+
+            continue
+
+
+
+        monaghan = (
+
+
+
+            1.0
+
+
+
+            + rp * (W[valid] / ww)**nn
+
+
+
+        )
+
+
+
+        gradC[i] = np.sum(
+
+
+
+            particle_volume
+
+
+
+            * monaghan[:, None]
+
+
+
+            * gradW[valid],
+
+
+
+            axis=0,
+
+
+
+        )
+
+
+
+    return gradC
+
+
+def reference_number_density(dx, hh):
+
+    """Dimensionless numerical density of an infinite regular 3-D lattice."""
+
+    kmax = int(np.ceil(2.0 * hh / dx))
+
+    coords = np.arange(-kmax, kmax + 1) * dx
+
+    lattice = np.array(np.meshgrid(coords, coords, coords, indexing="ij")).reshape(3,-1).T
+
+    r = np.linalg.norm(lattice, axis=1)
+
+    q = r / hh
+
+    f = np.where(q <= 1, 1-1.5*q*q+0.75*q**3,
+
+                 np.where(q < 2, 0.25*(2-q)**3, 0))
+
+    return float(dx**3 * np.sum(f) / (np.pi * hh**3))
+
+
+def classify_fs_fv_in(points, sdf, dx, hh):
+
+    """FS: near geometry surface; FV: non-FS with an FS neighbour in support;
+
+    IN: remaining particles. Return codes FS=1,FV=2,IN=3.
+
+    This SDF/adjacency classification adapts the paper's FS/FV/IN treatment to
+
+    an explicitly known Neuralangelo solid boundary; it is not paper [28]'s detector.
+
+    """
+
+    depth = -sdf if SDF_NEGATIVE_IS_INSIDE else sdf
+
+    fs = depth <= 0.5 * dx
+
+    fv = np.zeros(len(points), dtype=bool)
+
+    if np.any(fs):
+
+        fs_tree = cKDTree(points[fs])
+
+        dist, _ = fs_tree.query(points, k=1, distance_upper_bound=2.0*hh)
+
+        fv = (~fs) & (dist < 2.0*hh)
+
+    zone = np.full(len(points), 3, dtype=np.int64)
+
+    zone[fv] = 2
+
+    zone[fs] = 1
+
+    return fs, fv, zone
+
+
+def numerical_density_and_gradient(points, dx, hh, fs, fv, neighbors=None):
+
+    """Equations (59)-(61), applied with regular-lattice reference density.
+
+    FS psi=0; FV psi=max(relative density error,0); IN unrestricted.
+
+    """
+
+    n = len(points)
+
+    if neighbors is None:
+
+        neighbors = cKDTree(points).query_ball_point(points, 2.0*hh)
+
+    v = dx**3
+
+    ref = reference_number_density(dx, hh)
+
+    ww = cubic_spline_weight_at_dx(dx,hh)
+
+    rho = np.zeros(n)
+
+    cache = []
+
+    for i, nb in enumerate(neighbors):
+
+        ids = np.asarray(nb, dtype=np.int64)
+
+        ids = ids[ids != i]
+
+        W, gradW, r = cubic_spline_weight_and_grad_batch(points,i,ids,hh)
+
+        valid = (r > 1e-12) & (r < 2.0*hh)
+
+        ids, W, gradW = ids[valid], W[valid], gradW[valid]
+
+        rho[i] = v * (1.0 / (np.pi*hh**3) + np.sum(W))
+
+        cache.append((ids,W,gradW))
+
+    psi = rho/ref - 1.0
+
+    psi[fv] = np.maximum(psi[fv], 0.0)
+
+    psi[fs] = 0.0
+
+    gradpsi = np.zeros((n,3))
+
+    for i, (ids,W,gradW) in enumerate(cache):
+
+        if len(ids):
+
+            zeta = 1.0 + PST_MONAGHAN_RP*(W/ww)**PST_MONAGHAN_N
+
+            gradpsi[i] = v * np.sum(((psi[ids]-psi[i])*zeta)[:,None]*gradW,axis=0)
+
+    return rho, psi, gradpsi, ref
+
+def wendland_c2_grad_3d_batch(rij, h):
+    """3-D Wendland C2 kernel gradient, support r < 2h.
+
+    W = 21/(16*pi*h**3) * (1-q/2)**4 * (2*q+1), q=r/h.
+    dW/dr = -105/(16*pi*h**4) * q * (1-q/2)**3.
+    """
+    r = np.linalg.norm(rij, axis=1)
+    q = r / h
+    grad = np.zeros_like(rij)
+    valid = (r > 1e-12) & (q < 2.0)
+    if np.any(valid):
+        dwdr = -105.0 / (16.0 * np.pi * h**4) * q[valid] * (1.0 - 0.5*q[valid])**3
+        grad[valid] = (dwdr / r[valid])[:, None] * rij[valid]
+    return grad
+
+
+def cad_bpg_acceleration(points, dx, h, p0):
+    """Eq. (4), with rho=1, V=dx**3, m=rho*V.
+
+    Acceleration has the sign of repulsion for a monotonically decreasing kernel.
+    Returns acceleration and current neighbor lists.
+    """
+    tree = cKDTree(points)
+    neighbors = tree.query_ball_point(points, 2.0*h)
+    a = np.zeros_like(points)
+    vol = dx**3
+    for i, ids in enumerate(neighbors):
+        ids = np.asarray(ids, dtype=np.int64)
+        ids = ids[ids != i]
+        if len(ids) == 0:
+            continue
+        grad = wendland_c2_grad_3d_batch(points[i] - points[ids], h)
+        a[i] = -2.0 * p0 * vol * np.sum(grad, axis=0)
+    return a, neighbors
+
+
+# ---------------------------------------------------------------------------
+# Quality metrics: compare identical initial particle sets, no retriangulation
+# ---------------------------------------------------------------------------
+def quality_metrics(points, grid, dx, h, reference_volume=None,
+                    quality_stride=1, density_radius_ratio=2.0,
+                    include_arrays=True):
+    """Compute geometry, spacing and density diagnostics from CURRENT points.
+
+    Geometry RMSE is against the interpolated NSDF offset, NOT exact STL.
+    Particle volume is N*dx^3, NOT the volume of an alpha shape or surface.
+    Nearest-neighbor spacing metrics are restricted to deep-interior points
+    for their unbiased comparison; surface diagnostics use boundary centers.
+    """
+    p = np.asarray(points, float)
+    n = len(p)
+    phi = grid.query(p)
+    boundary = phi >= -dx
+    interior = phi < -max(2.0 * h, 2.0 * dx)
+    if not np.any(interior):
+        interior = phi < -dx
+    if not np.any(interior):
+        interior = np.ones(n, bool)
+    tree = cKDTree(p)
+    # Reuse global cKDTree to get nearest neighbor of each particle
+    nearest = tree.query(p, k=2, workers=-1)[0][:, 1] if n > 1 else np.full(n, np.nan)
+    # For surface offset the radius of the center is half a spacing inside.
+    error_surface = phi + dx / 2.0
+    # Local physical number density; benchmark values valid only in interior
+    radius = density_radius_ratio * dx
+    counts = tree.query_ball_point(p, r=radius, return_length=True, workers=-1) - 1
+    sphere_volume = (4.0 / 3.0) * np.pi * radius**3
+    local_density = counts / sphere_volume
+    local_density_normalized = counts / ((4.0 / 3.0) * np.pi * density_radius_ratio**3)
+    # Number density kernel is measured by existing numerical_density_and_gradient
+    mean_n = float(np.mean(local_density[interior])) if n else np.nan
+    dsel = nearest[interior]
+    cv = float(np.std(dsel)/np.mean(dsel)*100.0) if np.mean(dsel)>0 else np.nan
+    raw_volume = n * dx**3
+    values = dict(
+        n_particles=n,
+        n_boundary=int(boundary.sum()),
+        n_interior=int(interior.sum()),
+        particle_volume_sum=raw_volume,
+        reference_volume=(float(reference_volume) if reference_volume is not None else float('nan')),
+        volume_error_percent=(abs(raw_volume-reference_volume)/abs(reference_volume)*100.0
+                              if reference_volume is not None and reference_volume > 0 else float('nan')),
+        surface_offset_rmse=(float(np.sqrt(np.mean(error_surface[boundary]**2)))
+                             if boundary.any() else float('nan')),
+        surface_offset_mae=(float(np.mean(np.abs(error_surface[boundary])))
+                            if boundary.any() else float('nan')),
+        spacing_rmse=float(np.sqrt(np.mean((dsel-dx)**2))) if n>1 else float('nan'),
+        nearest_distance_mean=float(np.mean(dsel)) if n>1 else float('nan'),
+        nearest_distance_std=float(np.std(dsel)) if n>1 else float('nan'),
+        nearest_distance_cv_percent=cv,
+        interior_number_density_mean=mean_n,
+        interior_number_density_cv_percent=(float(np.std(local_density[interior])/mean_n*100.0)
+                                             if mean_n>0 else float('nan')),
+        interior_number_density_rmse_rel=(float(np.sqrt(np.mean(
+             (local_density[interior]/(dx**-3)-1.0)**2))) if n else float('nan')),
+        n_exact_duplicate_pairs=int(np.count_nonzero(nearest == 0.0))
+    )
+    arrays = None
+    if include_arrays:
+        arrays = {
+            'nearest_distance': nearest,
+            'spacing_abs_error': np.abs(nearest-dx),
+            'spacing_rel_error': (nearest-dx)/dx,
+            'surface_offset_abs_error': np.abs(error_surface),
+            'surface_offset_signed_error': error_surface,
+            'local_number_density': local_density,
+            'local_number_density_normalized': local_density_normalized,
+            'quality_interior_mask': interior.astype(np.int32),
+            'quality_boundary_mask': boundary.astype(np.int32),
+            'neighbor_count': counts.astype(np.int32),
+        }
+    return values, arrays
+
+
+def read_reference_volume(args, grid):
+    if not args.reference_stl:
+        return None
+    try:
+        import trimesh
+    except ImportError as exc:
+        raise ImportError('Install trimesh for --reference-stl') from exc
+    mesh = trimesh.load(args.reference_stl, force='mesh', process=True)
+    if not mesh.is_watertight:
+        raise ValueError('Reference STL must be watertight for meaningful mesh.volume')
+    with np.load(args.nsdf, allow_pickle=False) as z:
+        if 'normalize_scale' not in z or 'normalize_center' not in z:
+            raise ValueError('NSDF missing normalization metadata. Cannot align the reference STL.')
+        center = np.asarray(z['normalize_center'], float)
+        scale = float(z['normalize_scale'])
+    # The upstream NSDF generator centers at the bounding box midpoint.
+    if not np.allclose(center, mesh.bounds.mean(axis=0), atol=1e-8, rtol=1e-6):
+        raise ValueError('Reference STL bounding-box center differs from the NSDF source.')
+    volume = abs(float(mesh.volume)) * scale**3
+    print(f'[REFERENCE STL] normalized mesh volume={volume:.9g}', flush=True)
+    return volume
+
+
+def append_csv(path, row):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open('a', newline='', encoding='utf-8') as f:
+        writer = csv.DictWriter(f, fieldnames=list(row.keys()))
+        if f.tell() == 0:
+            writer.writeheader()
+        writer.writerow(row)
+
+
+def save_plots(out, names):
+    try:
+        import matplotlib
+        matplotlib.use('Agg')
+        import matplotlib.pyplot as plt
+    except ImportError:
+        print('[PLOTS] matplotlib not available; CSV files are still saved')
+        return
+    columns = [
+        ('normalized_rms_displacement', 'Normalized RMS displacement'),
+        ('surface_offset_rmse', 'Surface offset RMSE'),
+        ('spacing_rmse', 'Spacing RMSE'),
+        ('nearest_distance_cv_percent', 'Nearest neighbor CV (%)'),
+        ('interior_number_density_cv_percent', 'Interior number-density CV (%)'),
+        ('pseudo_kinetic_energy', 'Pseudo kinetic energy (method-specific)'),
+        ('elapsed_seconds', 'Elapsed time (s)'),
+    ]
+    for key, title in columns:
+        fig, ax = plt.subplots(figsize=(8, 4.5))
+        plotted = False
+        for name in names:
+            path = Path(out) / name / 'history.csv'
+            if not path.exists():
+                continue
+            with path.open(newline='', encoding='utf-8') as f:
+                rows = list(csv.DictReader(f))
+            xx = np.array([float(r['iteration']) for r in rows])
+            yy = np.array([float(r[key]) for r in rows])
+            ax.plot(xx, yy, label=name)
+            plotted = True
+        if plotted:
+            ax.set_xlabel('Iteration')
+            ax.set_ylabel(title)
+            ax.grid(True, alpha=0.3)
+            ax.legend()
+            fig.tight_layout()
+            fig.savefig(Path(out)/f'{key}.png', dpi=160)
+        plt.close(fig)
+
+
+def run_method(data, grid, args, prefix, method, reference_volume):
+    """Retains original relaxation kernels and adds observability/stop rules."""
+    dx = grid.dx
+    hh = (PST_HH_RATIO if method == 'gdps' else BPG_H_RATIO) * dx
+    pts = get_points(data).copy()
+    fixed = fixed_layers(pts, args.fixed_layers)
+    pts = project(pts, grid, dx, fixed=~fixed)
+    fixed_pos = pts[fixed].copy()
+    prefix = Path(prefix)
+    prefix.mkdir(parents=True, exist_ok=True)
+    consecutive = 0
+    stop_reason = 'maximum_iterations'
+    start = time.perf_counter()
+    cumulative_shift = np.zeros(len(pts), dtype=float)
+    last_move = np.zeros_like(pts)
+    history_path = prefix / 'history.csv'
+    if history_path.exists():
+        history_path.unlink()
+    for it in range(args.iters):
+        old = pts.copy()
+        if method == 'gdps':
+            # Original OPS+GDPS equations retained
+            pts = project(pts, grid, dx, fixed)
+            sdf = grid.query(pts)
+            fs, fv, zone = classify_fs_fv_in(pts, sdf, dx, hh)
+            gc = concentration_gradient_for_pst(pts, dx, hh)
+            rho, psi, gpsi, ref = numerical_density_and_gradient(pts, dx, hh, fs, fv)
+            dr = -C_SHIFT * dx**2 * gc - GDPS_C_VOL * dx**2 * gpsi
+            if np.any(fs):
+                _, norm = grid.query(pts[fs], True)
+                dr[fs] -= np.sum(dr[fs]*norm, axis=1)[:,None]*norm
+            dr[fixed] = 0
+            mag = np.linalg.norm(dr, axis=1)
+            mask = mag > PST_SHIFT_LIMIT_HH_RATIO*hh
+            dr[mask] *= (PST_SHIFT_LIMIT_HH_RATIO*hh/mag[mask])[:,None]
+            pts += dr
+            pts[fixed] = fixed_pos
+            pts = project(pts, grid, dx, fixed)
+            pts[fixed] = fixed_pos
+            pseudo_energy = 0.5 * float(np.mean(np.sum(dr**2, axis=1))) / dx**2
+        else:
+            # Original CAD-BPG equations retained
+            a, _ = cad_bpg_acceleration(pts, dx, hh, BPG_PRESSURE)
+            a[fixed] = 0
+            maxa = float(np.max(np.linalg.norm(a, axis=1))) if len(a) else 0.0
+            dt = BPG_CFL*np.sqrt(hh/maxa) if maxa > 1e-30 else 0.0
+            dr = 0.5 * a * dt**2
+            mag = np.linalg.norm(dr, axis=1)
+            mask = mag > BPG_MAX_SHIFT_RATIO*dx
+            dr[mask] *= (BPG_MAX_SHIFT_RATIO*dx/mag[mask])[:,None]
+            pts += dr
+            pts = project(pts, grid, dx, fixed)
+            pts[fixed] = fixed_pos
+            # Reset-to-zero instantaneous velocity estimate, method-specific.
+            pseudo_energy = 0.5 * float(np.mean(np.sum((a*dt)**2, axis=1)))
+        last_move = pts - old
+        cumulative_shift += np.linalg.norm(last_move, axis=1)
+        shift_rms = float(np.sqrt(np.mean(np.sum(last_move**2, axis=1)))/dx)
+        if shift_rms < args.shift_tol:
+            consecutive += 1
+        else:
+            consecutive = 0
+        reached_stop = args.auto_stop and it+1 >= args.min_iters and consecutive >= args.patience
+        output_step = (it==0 or (it+1)%args.metrics_every==0 or
+                       (it+1)%args.print_every==0 or it+1==args.iters or reached_stop)
+        if output_step:
+            q, _ = quality_metrics(pts, grid, dx, hh, reference_volume, include_arrays=False)
+            row = {'iteration':it+1, 'elapsed_seconds':time.perf_counter()-start,
+                   'normalized_rms_displacement':shift_rms,
+                   'pseudo_kinetic_energy':pseudo_energy,
+                   'consecutive_small_shifts':consecutive,
+                   **q}
+            append_csv(history_path, row)
+            print(f'[{"OPS+GDPS" if method=="gdps" else "CAD-BPG"}] '
+                  f'iter={it+1}/{args.iters} shift_rms={shift_rms:.4e} '
+                  f'spacing_rmse={q["spacing_rmse"]:.4e} '
+                  f'elapsed={row["elapsed_seconds"]:.1f}s', flush=True)
+        if args.write_every and (it+1)%args.write_every==0:
+            frame = cp(data)
+            set_points(frame, pts)
+            final_metadata(frame, grid, dx)
+            vals, arrays = quality_metrics(pts, grid, dx, hh, reference_volume)
+            frame['fixed_particle'] = fixed.astype(int)
+            frame['zone_id'] = classify_fs_fv_in(pts,frame['sdf'],dx,hh)[2]
+            arrays['cumulative_shift'] = cumulative_shift.copy()
+            write_vtk(prefix / f'relax_{it+1:04d}.vtk', frame,
+                      shift=last_move, metrics=arrays,
+                      display_diameter_ratio=args.display_diameter_ratio)
+        if reached_stop:
+            stop_reason = 'rms_shift_converged'
+            print(f'[CONVERGED] {method}: iteration {it+1}', flush=True)
+            break
+    # Original methods both project onto the implicit boundary before export
+    pts = project(pts, grid, dx)
+    set_points(data, pts)
+    final_metadata(data, grid, dx)
+    fs, fv, zone = classify_fs_fv_in(pts, data['sdf'], dx, hh)
+    rho, psi, gpsi, ref = numerical_density_and_gradient(pts, dx, hh, fs, fv)
+    data['zone_id'] = zone
+    data['fixed_particle'] = fixed.astype(int)
+    gd = (concentration_gradient_for_pst(pts, dx, hh)+gpsi) if method=='gdps' else gpsi
+    metrics, arrays = quality_metrics(pts, grid, dx, hh, reference_volume)
+    arrays['cumulative_shift'] = cumulative_shift.copy()
+    arrays['density_reference_ratio'] = rho / ref
+    arrays['density_reference_abs_error'] = np.abs(rho/ref-1.0)
+    arrays['density_reference_signed_error'] = rho/ref-1.0
+    metrics['kernel_density_rmse_all'] = float(np.sqrt(np.mean((rho/ref-1.0)**2)))
+    imask = arrays['quality_interior_mask'].astype(bool)
+    metrics['kernel_density_rmse_interior'] = float(np.sqrt(np.mean((rho[imask]/ref-1.0)**2)))
+    metrics['iterations'] = it+1 if args.iters else 0
+    metrics['relaxation_seconds'] = time.perf_counter()-start
+    metrics['stop_reason'] = stop_reason if args.iters else 'no_iterations'
+    metrics['method'] = 'OPS_GDPS' if method=='gdps' else 'CAD_BPG'
+    write_dat(prefix / 'final.dat', data)
+    write_vtk(prefix / 'final.vtk', data, rho, gd, last_move,
+              metrics=arrays, display_diameter_ratio=args.display_diameter_ratio)
+    with (prefix/'summary.json').open('w', encoding='utf-8') as f:
+        json.dump(metrics, f, indent=2, ensure_ascii=False, allow_nan=True)
+    print(f'[FINAL] {metrics["method"]} iterations={metrics["iterations"]} '
+          f'RMSE={metrics["spacing_rmse"]:.5g} CV={metrics["nearest_distance_cv_percent"]:.3g}%', flush=True)
+    return metrics
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument('nsdf', help='NPZ output of STL_SDF_paper.py (grid_sign required)')
+    ap.add_argument('--out', default='bunny_comparison')
+    ap.add_argument('--mode', choices=['both','gdps','cad','prepare'], default='both')
+    ap.add_argument('--subdiv', type=int, default=6)
+    ap.add_argument('--iters', type=int, default=150, help='Maximum iteration count')
+    ap.add_argument('--fixed-layers', type=int, default=2)
+    ap.add_argument('--write-every', type=int, default=0, help='Write per-step VTK; 0=final only')
+    ap.add_argument('--print-every', type=int, default=10)
+    ap.add_argument('--metrics-every', type=int, default=10)
+    ap.add_argument('--auto-stop', action='store_true', help='Enable common RMS-shift convergence')
+    ap.add_argument('--shift-tol', type=float, default=1e-3)
+    ap.add_argument('--patience', type=int, default=20)
+    ap.add_argument('--min-iters', type=int, default=100)
+    ap.add_argument('--reference-stl', default=None,
+                    help='Same original STL as NSDF; normalized volume is compared with N*dx^3')
+    ap.add_argument('--display-diameter-ratio', type=float, default=1.4,
+                    help='Display sphere diameter / dx (not a physical particle size change)')
+    args = ap.parse_args()
+    if (args.subdiv < 1 or args.iters < 0 or args.metrics_every < 1 or
+        args.print_every < 1 or args.display_diameter_ratio <= 0 or
+        args.shift_tol <= 0 or args.patience < 1 or args.min_iters < 0):
+        ap.error('Invalid argument values')
+    t0 = time.perf_counter()
+    grid = GridNSDF(args.nsdf)
+    ref_volume = read_reference_volume(args, grid)
+    out = Path(args.out)
+    out.mkdir(parents=True, exist_ok=True)
+    export_nsdf_stage(grid, args.nsdf, out)
+    write_before_vct(grid, out)
+    vct_start = time.perf_counter()
+    common = prepare(grid, args.subdiv)
+    vct_seconds = time.perf_counter() - vct_start
+    final_metadata(common, grid, grid.dx)
+    write_dat(out / 'initial_after_vct.dat', common)
+    init_q, init_arrays = quality_metrics(get_points(common),grid,grid.dx,
+                                          BPG_H_RATIO*grid.dx,ref_volume)
+    write_vtk(out/'initial_after_vct.vtk',common,metrics=init_arrays,
+              display_diameter_ratio=args.display_diameter_ratio)
+    np.savez_compressed(out/'initial_after_vct.npz',
+                        points=get_points(common).astype(np.float32),
+                        sdf=common['sdf'].astype(np.float32),dx=grid.dx)
+    results = []
+    names=[]
+    if args.mode in ('both','gdps'):
+        print('[RUN] OPS + GDPS', flush=True)
+        results.append(run_method(cp(common),grid,args,out/'OPS_GDPS','gdps',ref_volume))
+        names.append('OPS_GDPS')
+    if args.mode in ('both','cad'):
+        print('[RUN] CAD-BPG',flush=True)
+        results.append(run_method(cp(common),grid,args,out/'CAD_BPG','cad',ref_volume))
+        names.append('CAD_BPG')
+    save_plots(out, names)
+    with (out/'comparison.csv').open('w', newline='', encoding='utf-8') as f:
+        if results:
+            fields = list(results[0].keys())
+            writer=csv.DictWriter(f,fieldnames=fields)
+            writer.writeheader()
+            writer.writerows(results)
+    with (out/'run_info.json').open('w', encoding='utf-8') as f:
+        json.dump({'vct_seconds':vct_seconds,'total_seconds':time.perf_counter()-t0,
+                   'input_nsdf':str(args.nsdf),'reference_stl':args.reference_stl,
+                   'initial_metrics':init_q,'methods':results},f,indent=2,allow_nan=True)
+    print(f'[DONE] {out} -- comparison.csv, history.csv, final.vtk, plots',flush=True)
+
+
+if __name__ == '__main__':
+    main()
